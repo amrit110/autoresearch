@@ -405,6 +405,10 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
 
     console.print(_startup_panel(tag, max_turns, main_data))
 
+    # Remove any stale run.log so the monitor doesn't replay a previous session.
+    with contextlib.suppress(OSError):
+        LOG_PATH.unlink()
+
     # Start log monitor as a background task — no hooks needed, no IPC risk.
     monitor_task = asyncio.create_task(_monitor_log(LOG_PATH))
 
