@@ -10,12 +10,16 @@ and merges back to master if the session's best score beats master's best.
 
 import argparse
 import asyncio
+import atexit
 import contextlib
 import json
+import os
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import FrameType
 
 import anyio
 from claude_agent_sdk import (
@@ -52,6 +56,7 @@ from rich.table import Table
 
 console = Console()
 REPO_ROOT = Path(__file__).parent
+_PID_PATH = REPO_ROOT / "run.pid"
 
 # Keywords that make agent text worth surfacing to the user
 _INTERESTING = {
@@ -72,6 +77,31 @@ _INTERESTING = {
     "running",
     "result",
 }
+
+
+# ---------------------------------------------------------------------------
+# Experiment process cleanup
+# ---------------------------------------------------------------------------
+
+
+def _kill_experiment() -> None:
+    """Send SIGTERM to any infer.py process tracked in run.pid, then remove the file.
+
+    Safe to call multiple times — no-op if run.pid does not exist.
+    """
+    if not _PID_PATH.exists():
+        return
+    with contextlib.suppress(ValueError, OSError):
+        pid = int(_PID_PATH.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    with contextlib.suppress(OSError):
+        _PID_PATH.unlink()
+
+
+def _sigterm_handler(signum: int, frame: FrameType | None) -> None:
+    """Kill any running experiment then exit cleanly when we receive SIGTERM."""
+    _kill_experiment()
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +201,7 @@ Read `program.md` for full instructions. Key points:
 
 - You are on branch `autoresearch/{tag}`.
 - Modify only `infer.py` to improve the GSM8K score.
-- Run experiments: `uv run infer.py > run.log 2>&1`
+- Run experiments: `uv run infer.py > run.log 2>&1 & echo $! > run.pid; wait $!; rm -f run.pid`
 - Extract results: `grep "^score:\\|^accuracy:\\|^tokens_per_sec:" run.log`
 - Log to `results.tsv` (tab-separated, columns: commit score accuracy tokens_per_sec status description).
 - Kept experiments: git commit stays. Discarded: `git reset --hard HEAD~1`.
@@ -329,6 +359,35 @@ def _make_hooks(log_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _startup_panel(tag: str, max_turns: int, main_data: dict) -> Panel:
+    """Build the rich Panel shown at session start."""
+    infer_model = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+    infer_model_short = infer_model.split("/")[-1]  # e.g. "Qwen2.5-0.5B-Instruct"
+    time_budget = int(os.environ.get("AUTORESEARCH_TIME_BUDGET", "300"))
+    date_str = datetime.now().strftime("%Y-%m-%d  %H:%M")
+
+    baseline = main_data.get("baseline_score")
+    best = main_data.get("best_score")
+
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column(style="dim", min_width=18)
+    t.add_column()
+
+    t.add_row("tag", f"[yellow]{tag}[/yellow]")
+    t.add_row("branch", f"[dim]autoresearch/{tag}[/dim]")
+    t.add_row("date", f"[dim]{date_str}[/dim]")
+    t.add_row("", "")
+    t.add_row("inference model", f"[cyan]{infer_model_short}[/cyan]")
+    t.add_row("agent model", "claude-opus-4-6")
+    t.add_row("time budget", f"{time_budget // 60} min / run")
+    t.add_row("max turns", str(max_turns))
+    t.add_row("", "")
+    t.add_row("master baseline", str(baseline) if baseline is not None else "[dim]—[/dim]")
+    t.add_row("master best", str(best) if best is not None else "[dim]—[/dim]")
+
+    return Panel(t, title="[bold cyan]autoresearch[/bold cyan]", expand=False)
+
+
 async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
     """Launch Claude Opus 4.6 agent and stream filtered output until completion."""
     prompt = build_prompt(
@@ -337,19 +396,7 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
         main_data.get("best_score"),
     )
 
-    console.print(
-        Panel(
-            f"[bold cyan]autoresearch agent[/bold cyan]\n\n"
-            f"  tag         [yellow]{tag}[/yellow]\n"
-            f"  branch      [dim]autoresearch/{tag}[/dim]\n"
-            f"  model       claude-opus-4-6\n"
-            f"  max turns   {max_turns}\n"
-            f"  baseline    [dim]{main_data.get('baseline_score') or 'not established'}[/dim]\n"
-            f"  master best [dim]{main_data.get('best_score') or 'not established'}[/dim]",
-            title="[bold]session start[/bold]",
-            expand=False,
-        )
-    )
+    console.print(_startup_panel(tag, max_turns, main_data))
 
     options = ClaudeAgentOptions(
         cwd=str(REPO_ROOT),
@@ -366,14 +413,12 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
         hooks=_make_hooks(LOG_PATH),
     )
 
-    turn = 0
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, SystemMessage) and message.subtype == "init":
             sid = message.data.get("session_id", "")
             console.print(f"[dim]session: {sid}[/dim]\n")
 
         elif isinstance(message, AssistantMessage):
-            turn += 1
             for block in message.content:
                 if not isinstance(block, TextBlock):
                     continue
@@ -470,6 +515,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """Entry point: create session branch, run agent, evaluate and optionally merge."""
+    # Register cleanup so infer.py is never left orphaned, regardless of how we exit.
+    atexit.register(_kill_experiment)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     args = parse_args()
     tag = args.tag
     branch = f"autoresearch/{tag}"
@@ -510,6 +559,7 @@ def main() -> None:
         sys.exit(1)
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠[/yellow] Interrupted.")
+        _kill_experiment()
 
     # Evaluate and optionally merge
     post_session(tag, main_data)

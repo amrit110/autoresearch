@@ -34,7 +34,7 @@ console = Console()
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MODEL_ID = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+MODEL_ID = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 TIME_BUDGET = int(os.environ.get("AUTORESEARCH_TIME_BUDGET", "300"))  # default 5 min
 
@@ -202,6 +202,13 @@ def evaluate(solve_fn):
                 f"[cyan]{tps:.0f}[/cyan] tok/s"
             )
             progress.update(task, completed=min(elapsed, TIME_BUDGET), description=desc)
+            if not console.is_terminal:
+                remaining = max(0, TIME_BUDGET - elapsed)
+                print(
+                    f"  [{int(elapsed):3d}s/{TIME_BUDGET}s | {int(remaining):3d}s left]"
+                    f"  {correct}/{attempted} ✓  acc {acc:.3f}  {tps:.0f} tok/s",
+                    flush=True,
+                )
 
     time_elapsed = time.time() - t_start
     accuracy = correct / attempted if attempted > 0 else 0.0

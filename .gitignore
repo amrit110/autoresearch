@@ -22,3 +22,4 @@ dev/
 # Results and scratch files
 results.tsv
 run.log
+run.pid
