@@ -229,6 +229,15 @@ def apply_to_main(
 
         (REPO_ROOT / "infer.py").write_text(infer_content)
 
+        # Run pre-commit fixers (ruff format/check, trailing whitespace, EOF)
+        # so the commit doesn't fail due to style issues in agent-generated code.
+        subprocess.run(
+            ["uv", "run", "pre-commit", "run", "--files", "infer.py"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+
         updated = {
             **main_data,
             "best_score": session_score,
