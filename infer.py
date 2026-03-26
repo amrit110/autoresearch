@@ -27,13 +27,9 @@ console = Console()
 # Hyperparameters (edit freely)
 # ---------------------------------------------------------------------------
 
-MAX_NEW_TOKENS = 512  # generation budget per problem; lower = faster, higher = more reasoning room
+MAX_NEW_TOKENS = 256  # generation budget per problem; lower = faster, higher = more reasoning room
 DO_SAMPLE = False  # greedy decoding by default
 TEMPERATURE = 1.0  # only applies if DO_SAMPLE = True
-
-SYSTEM_PROMPT = (
-    "Solve the math problem step by step. After your reasoning, write the final numerical answer on the last line."
-)
 
 # ---------------------------------------------------------------------------
 # INFERENCE STRATEGY — agents modify this section
@@ -73,10 +69,7 @@ def solve(model, tokenizer, problem: str) -> str:  # type: ignore[no-untyped-def
     - Early stopping: detect answer token and stop immediately
     - Batch multiple problems per forward pass (set tokenizer.padding_side = "left")
     """
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": problem},
-    ]
+    messages = [{"role": "user", "content": problem}]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     with torch.no_grad():

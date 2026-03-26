@@ -1,7 +1,7 @@
 {
-  "baseline_score": 2,
-  "best_score": 2,
-  "best_description": "baseline greedy no-CoT",
-  "best_branch": "autoresearch/mar26",
-  "updated_at": "2026-03-26T21:51:10.848348+00:00"
+  "baseline_score": null,
+  "best_score": null,
+  "best_description": null,
+  "best_branch": null,
+  "updated_at": null
 }

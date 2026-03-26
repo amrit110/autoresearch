@@ -145,6 +145,9 @@ def best_kept(rows: list[dict]) -> tuple[int | None, str | None]:
 # best.json helpers
 # ---------------------------------------------------------------------------
 
+EXPERIMENTS_PATH = REPO_ROOT / "experiments.tsv"
+_EXP_HEADER = "session\tcommit\tscore\taccuracy\ttokens_per_sec\tstatus\tdescription"
+
 
 def read_best_json_from_main() -> dict:
     """Read best.json from master branch (not working tree)."""
@@ -164,6 +167,23 @@ def read_best_json_from_main() -> dict:
 def write_best_json(data: dict) -> None:
     """Serialise data to best.json in the repo root."""
     (REPO_ROOT / "best.json").write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _append_experiments(tag: str, rows: list[dict]) -> None:
+    """Append session rows to experiments.tsv (call while checked out on master)."""
+    new_lines = "\n".join(
+        f"{tag}\t{r.get('commit', '')}\t{r.get('score', '')}\t"
+        f"{r.get('accuracy', '')}\t{r.get('tokens_per_sec', '')}\t"
+        f"{r.get('status', '')}\t{r.get('description', '')}"
+        for r in rows
+    )
+    if not EXPERIMENTS_PATH.exists():
+        EXPERIMENTS_PATH.write_text(_EXP_HEADER + "\n" + new_lines + "\n")
+    else:
+        existing = EXPERIMENTS_PATH.read_text()
+        if not existing.endswith("\n"):
+            existing += "\n"
+        EXPERIMENTS_PATH.write_text(existing + new_lines + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +210,14 @@ Read `program.md` for full instructions. Key points:
 - Log to `results.tsv` (tab-separated, columns: commit score accuracy tokens_per_sec status description).
 - Kept experiments: git commit stays. Discarded: `git reset --hard HEAD~1`.
 
+## Score = accuracy × throughput
+
+`score` = correct answers in the fixed time window. It rewards **both** axes:
+- Higher accuracy (better prompting, CoT, self-consistency)
+- Higher throughput (faster generation, batching, quantization, fewer tokens)
+
+A 2× speed-up that keeps accuracy constant doubles the score. Always consider both.
+
 ## Score targets to beat
 
 - Master baseline (unmodified infer.py): **{baseline_str}**
@@ -205,80 +233,86 @@ NEVER commit to or checkout the master branch — stay on `autoresearch/{tag}` a
 
 
 # ---------------------------------------------------------------------------
-# Merge session improvements to main
+# Commit session results to master
 # ---------------------------------------------------------------------------
 
 
-def apply_to_main(
-    tag: str,
-    session_score: int,
-    session_description: str,
-    main_data: dict,
-) -> bool:
-    """Copy HEAD infer.py from session branch to master, update best.json."""
+def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
+    """Append session experiments to master and merge infer.py if score improved.
+
+    Always commits experiments.tsv so every run is tracked, even when there is
+    no improvement.  If the session's best kept score beats master best, also
+    updates infer.py and best.json in the same commit.
+    """
+    if not rows:
+        return
+
+    session_score, session_desc = best_kept(rows)
+    main_best = main_data.get("best_score")
+    main_baseline = main_data.get("baseline_score")
+
+    improved = session_score is not None and (main_best is None or session_score > main_best)
+    record_bl = main_baseline is None
+
     original_branch = current_branch()
     try:
-        # Grab infer.py content from the tip of the session branch
-        infer_content = git("show", f"autoresearch/{tag}:infer.py")
-        master_content = git("show", "master:infer.py")
-
-        if infer_content == master_content:
-            console.print("[dim]infer.py unchanged from master — nothing to merge[/dim]")
-            return False
-
         git("checkout", "master")
 
-        (REPO_ROOT / "infer.py").write_text(infer_content)
+        _append_experiments(tag, rows)
+        files_to_add = ["experiments.tsv"]
 
-        # Run pre-commit fixers (ruff format/check, trailing whitespace, EOF)
-        # so the commit doesn't fail due to style issues in agent-generated code.
-        subprocess.run(
-            ["uv", "run", "pre-commit", "run", "--files", "infer.py"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            check=False,
-        )
+        if improved and session_score is not None and session_desc is not None:
+            infer_content = git("show", f"autoresearch/{tag}:infer.py")
+            master_infer = (REPO_ROOT / "infer.py").read_text()
+            if infer_content != master_infer:
+                (REPO_ROOT / "infer.py").write_text(infer_content)
+                # Fix any style issues the agent introduced before committing.
+                subprocess.run(
+                    ["uv", "run", "pre-commit", "run", "--files", "infer.py"],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    check=False,
+                )
+                files_to_add.append("infer.py")
 
-        updated = {
-            **main_data,
-            "best_score": session_score,
-            "best_description": session_description,
-            "best_branch": f"autoresearch/{tag}",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        write_best_json(updated)
+            updated_best: dict = {
+                **main_data,
+                "best_score": session_score,
+                "best_description": session_desc,
+                "best_branch": f"autoresearch/{tag}",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if record_bl:
+                first_kept = next((r for r in rows if r.get("status") == "keep"), None)
+                if first_kept:
+                    with contextlib.suppress(ValueError, TypeError):
+                        updated_best["baseline_score"] = int(first_kept["score"])
+            write_best_json(updated_best)
+            files_to_add.append("best.json")
+            msg = f"autoresearch/{tag}: {session_desc} (score: {session_score})"
 
-        git("add", "infer.py", "best.json")
-        msg = f"autoresearch/{tag}: {session_description} (score: {session_score})"
+        elif record_bl:
+            first_kept = next((r for r in rows if r.get("status") == "keep"), None)
+            if first_kept:
+                with contextlib.suppress(ValueError, TypeError):
+                    bl = int(first_kept["score"])
+                    updated_bl: dict = {
+                        **main_data,
+                        "baseline_score": bl,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    write_best_json(updated_bl)
+                    files_to_add.append("best.json")
+            msg = f"autoresearch/{tag}: record baseline + {len(rows)} experiment(s)"
+        else:
+            msg = f"autoresearch/{tag}: {len(rows)} experiment(s), no improvement"
+
+        git("add", *files_to_add)
         git("commit", "-m", msg)
-
-        console.print(f"[green]✓[/green] Merged to master: [italic]{msg}[/italic]")
-        return True
+        console.print(f"[green]✓[/green] Committed to master: [italic]{msg}[/italic]")
 
     except Exception as exc:
-        console.print(f"[red]✗[/red] Failed to apply to master: {exc}")
-        return False
-
-    finally:
-        git("checkout", original_branch, check=False)
-
-
-def record_baseline(tag: str, baseline_score: int, main_data: dict) -> None:
-    """Write baseline_score into best.json on master (first-ever session only)."""
-    original_branch = current_branch()
-    try:
-        git("checkout", "master")
-        updated = {
-            **main_data,
-            "baseline_score": baseline_score,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        write_best_json(updated)
-        git("add", "best.json")
-        git("commit", "-m", f"autoresearch/{tag}: record baseline score ({baseline_score})")
-        console.print(f"[green]✓[/green] Recorded baseline: {baseline_score}")
-    except Exception as exc:
-        console.print(f"[yellow]⚠[/yellow] Could not record baseline: {exc}")
+        console.print(f"[red]✗[/red] Failed to commit to master: {exc}")
     finally:
         git("checkout", original_branch, check=False)
 
@@ -421,7 +455,7 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
 
 
 def post_session(tag: str, main_data: dict) -> None:
-    """Print session summary and merge to master if the session beat the best score."""
+    """Print session summary and commit results to master."""
     rows = read_results(REPO_ROOT / "results.tsv")
     session_score, session_desc = best_kept(rows)
 
@@ -447,24 +481,16 @@ def post_session(tag: str, main_data: dict) -> None:
     table.add_row("session best", f"[cyan]{session_score}[/cyan]" if session_score is not None else "[dim]—[/dim]")
     table.add_row("", "")
 
-    if improved and session_score is not None and session_desc is not None:
+    if improved and session_score is not None:
         delta = session_score - (main_best or 0)
-        table.add_row("outcome", f"[green]IMPROVED +{delta} → merging to master[/green]")
+        table.add_row("outcome", f"[green]IMPROVED +{delta} → committing to master[/green]")
     else:
-        table.add_row("outcome", "[yellow]no improvement[/yellow]")
+        table.add_row("outcome", "[yellow]no improvement — recording experiments[/yellow]")
 
     console.print()
     console.print(Panel(table, title="[bold]session summary[/bold]", expand=False))
 
-    if improved and session_score is not None and session_desc is not None:
-        apply_to_main(tag, session_score, session_desc, main_data)
-
-    # Record baseline if this was the very first session
-    if main_baseline is None and rows:
-        first_kept = next((r for r in rows if r.get("status") == "keep"), None)
-        if first_kept:
-            with contextlib.suppress(ValueError, TypeError):
-                record_baseline(tag, int(first_kept["score"]), main_data)
+    commit_to_master(tag, rows, main_data)
 
 
 # ---------------------------------------------------------------------------
