@@ -27,26 +27,10 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     CLIConnectionError,
     CLINotFoundError,
-    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
     query,
-)
-from claude_agent_sdk.types import (
-    AsyncHookJSONOutput,
-    HookContext,
-    NotificationHookInput,
-    PermissionRequestHookInput,
-    PostToolUseFailureHookInput,
-    PostToolUseHookInput,
-    PreCompactHookInput,
-    PreToolUseHookInput,
-    StopHookInput,
-    SubagentStartHookInput,
-    SubagentStopHookInput,
-    SyncHookJSONOutput,
-    UserPromptSubmitHookInput,
 )
 from rich.console import Console
 from rich.panel import Panel
@@ -235,6 +219,11 @@ def apply_to_main(
     try:
         # Grab infer.py content from the tip of the session branch
         infer_content = git("show", f"autoresearch/{tag}:infer.py")
+        master_content = git("show", "master:infer.py")
+
+        if infer_content == master_content:
+            console.print("[dim]infer.py unchanged from master — nothing to merge[/dim]")
+            return False
 
         git("checkout", "master")
 
@@ -291,66 +280,41 @@ def record_baseline(tag: str, baseline_score: int, main_data: dict) -> None:
 LOG_PATH = REPO_ROOT / "run.log"
 
 
-async def _stream_log(log_path: Path) -> None:
-    """Tail log_path line-by-line from byte 0 until cancelled, printing each line live."""
-    while not log_path.exists():
-        await asyncio.sleep(0.1)
-    with log_path.open() as fh:
-        # Read from the beginning — pre_tool deletes any stale file before this runs.
-        while True:
-            line = fh.readline()
-            if line:
-                console.print(f"  [dim]{line.rstrip()}[/dim]", highlight=False)
-            else:
-                await asyncio.sleep(0.15)
+async def _monitor_log(log_path: Path) -> None:
+    """Stream run.log continuously for the entire session, auto-detecting new runs.
 
-
-_HookInput = (
-    PreToolUseHookInput
-    | PostToolUseHookInput
-    | PostToolUseFailureHookInput
-    | UserPromptSubmitHookInput
-    | StopHookInput
-    | SubagentStopHookInput
-    | PreCompactHookInput
-    | NotificationHookInput
-    | SubagentStartHookInput
-    | PermissionRequestHookInput
-)
-_HookReturn = AsyncHookJSONOutput | SyncHookJSONOutput
-
-
-def _make_hooks(log_path: Path) -> dict:
-    """Return a PreToolUse hook that streams run.log while infer.py is running.
-
-    The tail task is cancelled at the start of the next run (via this same hook)
-    and cleaned up automatically by anyio when the session ends.  There is no
-    PostToolUse hook — that hook fires after session teardown begins and causes
-    a "Stream closed" error in the CLI.
+    Runs as a plain asyncio background task — no SDK hook IPC, no "Stream closed"
+    errors.  File truncation (new run started) is detected by comparing stat size
+    to our read position; when size < pos the cursor resets to byte 0.
     """
-    tail_task: list[asyncio.Task] = []  # mutable container for the background task
-
-    async def pre_tool(input_data: _HookInput, tool_use_id: str | None, context: HookContext) -> _HookReturn:
-        """Start tailing run.log when the agent kicks off infer.py."""
-        raw = dict(input_data).get("tool_input", {})
-        cmd = raw.get("command", "") if isinstance(raw, dict) else ""
-        if "infer.py" in cmd and "run.log" in cmd:
-            # Cancel any tail from a previous run and print a blank separator line.
-            if tail_task:
-                tail_task[0].cancel()
-                tail_task.clear()
-                console.print()
-            ts = datetime.now().strftime("%H:%M:%S")
-            console.print(f"[dim]{ts}[/dim]  [cyan]▶ infer.py running…[/cyan]")
-            # Delete any stale log so _stream_log always reads from byte 0.
-            # The bash redirect (> run.log) truncates the file but doesn't reset
-            # an existing file-handle's position, causing the tail to read nothing.
-            with contextlib.suppress(OSError):
-                log_path.unlink()
-            tail_task.append(asyncio.create_task(_stream_log(log_path)))
-        return {}
-
-    return {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool])]}
+    pos = 0
+    run_announced = False
+    while True:
+        try:
+            if log_path.exists():
+                size = log_path.stat().st_size
+                if size < pos:
+                    # File was truncated → a new run has started
+                    pos = 0
+                    run_announced = False
+                if size > pos:
+                    with log_path.open("rb") as fh:
+                        fh.seek(pos)
+                        chunk = fh.read(size - pos)
+                    for raw_line in chunk.splitlines():
+                        line = raw_line.decode("utf-8", errors="replace").rstrip()
+                        if not line:
+                            continue
+                        if "Starting evaluation" in line and not run_announced:
+                            run_announced = True
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            console.print(f"[dim]{ts}[/dim]  [cyan]▶ infer.py running…[/cyan]")
+                        console.print(f"  [dim]{line}[/dim]", highlight=False)
+                    pos = size
+        except OSError:
+            pos = 0
+            run_announced = False
+        await asyncio.sleep(0.15)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +361,9 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
 
     console.print(_startup_panel(tag, max_turns, main_data))
 
+    # Start log monitor as a background task — no hooks needed, no IPC risk.
+    monitor_task = asyncio.create_task(_monitor_log(LOG_PATH))
+
     options = ClaudeAgentOptions(
         cwd=str(REPO_ROOT),
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
@@ -409,29 +376,33 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
             "Never ask for permission or confirmation — act autonomously."
         ),
         setting_sources=[],  # ignore project CLAUDE.md so program.md drives everything
-        hooks=_make_hooks(LOG_PATH),
     )
 
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, SystemMessage) and message.subtype == "init":
-            sid = message.data.get("session_id", "")
-            console.print(f"[dim]session: {sid}[/dim]\n")
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                sid = message.data.get("session_id", "")
+                console.print(f"[dim]session: {sid}[/dim]\n")
 
-        elif isinstance(message, AssistantMessage):
-            for block in message.content:
-                if not isinstance(block, TextBlock):
-                    continue
-                lines = block.text.splitlines()
-                interesting = [ln for ln in lines if any(kw in ln.lower() for kw in _INTERESTING)]
-                if interesting:
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    for ln in interesting:
-                        console.print(f"[dim]{ts}[/dim]  {ln}")
+            elif isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if not isinstance(block, TextBlock):
+                        continue
+                    lines = block.text.splitlines()
+                    interesting = [ln for ln in lines if any(kw in ln.lower() for kw in _INTERESTING)]
+                    if interesting:
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        for ln in interesting:
+                            console.print(f"[dim]{ts}[/dim]  {ln}")
 
-        elif isinstance(message, ResultMessage):
-            status = "error" if message.is_error else "ok"
-            cost = f"  cost: ${message.total_cost_usd:.4f}" if message.total_cost_usd else ""
-            console.print(f"\n[dim]agent finished — turns: {message.num_turns}  status: {status}{cost}[/dim]")
+            elif isinstance(message, ResultMessage):
+                status = "error" if message.is_error else "ok"
+                cost = f"  cost: ${message.total_cost_usd:.4f}" if message.total_cost_usd else ""
+                console.print(f"\n[dim]agent finished — turns: {message.num_turns}  status: {status}{cost}[/dim]")
+    finally:
+        monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
 
 
 # ---------------------------------------------------------------------------
