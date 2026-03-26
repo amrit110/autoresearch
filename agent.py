@@ -9,6 +9,7 @@ and merges back to master if the session's best score beats master's best.
 """
 
 import argparse
+import asyncio
 import contextlib
 import json
 import subprocess
@@ -22,10 +23,26 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     CLIConnectionError,
     CLINotFoundError,
+    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
     query,
+)
+from claude_agent_sdk.types import (
+    AsyncHookJSONOutput,
+    HookContext,
+    NotificationHookInput,
+    PermissionRequestHookInput,
+    PostToolUseFailureHookInput,
+    PostToolUseHookInput,
+    PreCompactHookInput,
+    PreToolUseHookInput,
+    StopHookInput,
+    SubagentStartHookInput,
+    SubagentStopHookInput,
+    SyncHookJSONOutput,
+    UserPromptSubmitHookInput,
 )
 from rich.console import Console
 from rich.panel import Panel
@@ -238,6 +255,76 @@ def record_baseline(tag: str, baseline_score: int, main_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live log streaming
+# ---------------------------------------------------------------------------
+
+LOG_PATH = REPO_ROOT / "run.log"
+
+
+async def _stream_log(log_path: Path) -> None:
+    """Tail log_path line-by-line until cancelled, printing each line live."""
+    while not log_path.exists():
+        await asyncio.sleep(0.3)
+    with log_path.open() as fh:
+        fh.seek(0, 2)  # start from end of any pre-existing content
+        while True:
+            line = fh.readline()
+            if line:
+                console.print(f"  [dim]{line.rstrip()}[/dim]", highlight=False)
+            else:
+                await asyncio.sleep(0.15)
+
+
+_HookInput = (
+    PreToolUseHookInput
+    | PostToolUseHookInput
+    | PostToolUseFailureHookInput
+    | UserPromptSubmitHookInput
+    | StopHookInput
+    | SubagentStopHookInput
+    | PreCompactHookInput
+    | NotificationHookInput
+    | SubagentStartHookInput
+    | PermissionRequestHookInput
+)
+_HookReturn = AsyncHookJSONOutput | SyncHookJSONOutput
+
+
+def _make_hooks(log_path: Path) -> dict:
+    """Return PreToolUse/PostToolUse hooks that stream run.log during infer.py runs."""
+    tail_task: list[asyncio.Task] = []  # mutable container for the background task
+
+    async def pre_tool(input_data: _HookInput, tool_use_id: str | None, context: HookContext) -> _HookReturn:
+        """Start tailing run.log when the agent kicks off infer.py."""
+        raw = dict(input_data).get("tool_input", {})
+        cmd = raw.get("command", "") if isinstance(raw, dict) else ""
+        if "infer.py" in cmd and "run.log" in cmd:
+            ts = datetime.now().strftime("%H:%M:%S")
+            console.print(f"\n[dim]{ts}[/dim]  [cyan]▶ infer.py running…[/cyan]")
+            if tail_task:
+                tail_task[0].cancel()
+                tail_task.clear()
+            tail_task.append(asyncio.create_task(_stream_log(log_path)))
+        return {}
+
+    async def post_tool(input_data: _HookInput, tool_use_id: str | None, context: HookContext) -> _HookReturn:
+        """Stop tailing once infer.py finishes."""
+        raw = dict(input_data).get("tool_input", {})
+        cmd = raw.get("command", "") if isinstance(raw, dict) else ""
+        if "infer.py" in cmd and "run.log" in cmd and tail_task:
+            await asyncio.sleep(0.4)  # let last lines flush through
+            tail_task[0].cancel()
+            tail_task.clear()
+            console.print()
+        return {}
+
+    return {
+        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool])],
+        "PostToolUse": [HookMatcher(matcher="Bash", hooks=[post_tool])],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Agent runner
 # ---------------------------------------------------------------------------
 
@@ -276,6 +363,7 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
             "Never ask for permission or confirmation — act autonomously."
         ),
         setting_sources=[],  # ignore project CLAUDE.md so program.md drives everything
+        hooks=_make_hooks(LOG_PATH),
     )
 
     turn = 0
