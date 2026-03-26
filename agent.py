@@ -321,7 +321,13 @@ _HookReturn = AsyncHookJSONOutput | SyncHookJSONOutput
 
 
 def _make_hooks(log_path: Path) -> dict:
-    """Return PreToolUse/PostToolUse hooks that stream run.log during infer.py runs."""
+    """Return a PreToolUse hook that streams run.log while infer.py is running.
+
+    The tail task is cancelled at the start of the next run (via this same hook)
+    and cleaned up automatically by anyio when the session ends.  There is no
+    PostToolUse hook — that hook fires after session teardown begins and causes
+    a "Stream closed" error in the CLI.
+    """
     tail_task: list[asyncio.Task] = []  # mutable container for the background task
 
     async def pre_tool(input_data: _HookInput, tool_use_id: str | None, context: HookContext) -> _HookReturn:
@@ -329,11 +335,13 @@ def _make_hooks(log_path: Path) -> dict:
         raw = dict(input_data).get("tool_input", {})
         cmd = raw.get("command", "") if isinstance(raw, dict) else ""
         if "infer.py" in cmd and "run.log" in cmd:
-            ts = datetime.now().strftime("%H:%M:%S")
-            console.print(f"\n[dim]{ts}[/dim]  [cyan]▶ infer.py running…[/cyan]")
+            # Cancel any tail from a previous run and print a blank separator line.
             if tail_task:
                 tail_task[0].cancel()
                 tail_task.clear()
+                console.print()
+            ts = datetime.now().strftime("%H:%M:%S")
+            console.print(f"[dim]{ts}[/dim]  [cyan]▶ infer.py running…[/cyan]")
             # Delete any stale log so _stream_log always reads from byte 0.
             # The bash redirect (> run.log) truncates the file but doesn't reset
             # an existing file-handle's position, causing the tail to read nothing.
@@ -342,20 +350,7 @@ def _make_hooks(log_path: Path) -> dict:
             tail_task.append(asyncio.create_task(_stream_log(log_path)))
         return {}
 
-    async def post_tool(input_data: _HookInput, tool_use_id: str | None, context: HookContext) -> _HookReturn:
-        """Stop tailing once infer.py finishes."""
-        raw = dict(input_data).get("tool_input", {})
-        cmd = raw.get("command", "") if isinstance(raw, dict) else ""
-        if "infer.py" in cmd and "run.log" in cmd and tail_task:
-            tail_task[0].cancel()
-            tail_task.clear()
-            console.print()
-        return {}
-
-    return {
-        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool])],
-        "PostToolUse": [HookMatcher(matcher="Bash", hooks=[post_tool])],
-    }
+    return {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool])]}
 
 
 # ---------------------------------------------------------------------------
