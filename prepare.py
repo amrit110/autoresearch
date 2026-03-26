@@ -26,8 +26,10 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import logging as hf_logging
 
 
+hf_logging.set_verbosity_error()
 console = Console()
 
 # ---------------------------------------------------------------------------

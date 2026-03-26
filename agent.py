@@ -292,11 +292,11 @@ LOG_PATH = REPO_ROOT / "run.log"
 
 
 async def _stream_log(log_path: Path) -> None:
-    """Tail log_path line-by-line until cancelled, printing each line live."""
+    """Tail log_path line-by-line from byte 0 until cancelled, printing each line live."""
     while not log_path.exists():
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
     with log_path.open() as fh:
-        fh.seek(0, 2)  # start from end of any pre-existing content
+        # Read from the beginning — pre_tool deletes any stale file before this runs.
         while True:
             line = fh.readline()
             if line:
@@ -334,6 +334,11 @@ def _make_hooks(log_path: Path) -> dict:
             if tail_task:
                 tail_task[0].cancel()
                 tail_task.clear()
+            # Delete any stale log so _stream_log always reads from byte 0.
+            # The bash redirect (> run.log) truncates the file but doesn't reset
+            # an existing file-handle's position, causing the tail to read nothing.
+            with contextlib.suppress(OSError):
+                log_path.unlink()
             tail_task.append(asyncio.create_task(_stream_log(log_path)))
         return {}
 
