@@ -200,7 +200,8 @@ Beat master best to have changes merged back to master automatically.
 ## Start
 
 Read `program.md` → `prepare.py` → `infer.py`, then run the baseline first (no modifications).
-NEVER stop or ask for confirmation. Run until interrupted."""
+NEVER stop or ask for confirmation. Run until interrupted.
+NEVER commit to or checkout the master branch — stay on `autoresearch/{tag}` at all times."""
 
 
 # ---------------------------------------------------------------------------
