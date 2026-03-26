@@ -347,7 +347,6 @@ def _make_hooks(log_path: Path) -> dict:
         raw = dict(input_data).get("tool_input", {})
         cmd = raw.get("command", "") if isinstance(raw, dict) else ""
         if "infer.py" in cmd and "run.log" in cmd and tail_task:
-            await asyncio.sleep(0.4)  # let last lines flush through
             tail_task[0].cancel()
             tail_task.clear()
             console.print()
