@@ -19,5 +19,6 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Results and scratch files
 results.tsv
+run.log
