@@ -44,15 +44,15 @@ _PID_PATH = REPO_ROOT / "run.pid"
 
 # Keywords that make agent text worth surfacing to the user
 _INTERESTING = {
-    "score",
-    "accuracy",
+    "tps",
+    "bpb",
+    "tok/s",
     "keep",
     "discard",
     "crash",
     "baseline",
     "experiment",
     "improvement",
-    "tok/s",
     "error",
     "failed",
     "✓",
@@ -132,13 +132,13 @@ def read_results(path: Path) -> list[dict]:
     return rows
 
 
-def best_kept(rows: list[dict]) -> tuple[int | None, str | None]:
-    """Return (score, description) of the highest-scoring kept experiment."""
+def best_kept(rows: list[dict]) -> tuple[float | None, str | None]:
+    """Return (tokens_per_sec, description) of the highest-tps kept experiment."""
     kept = [r for r in rows if r.get("status") == "keep"]
     if not kept:
         return None, None
-    best = max(kept, key=lambda r: int(r.get("score") or 0))
-    return int(best["score"]), best.get("description", "")
+    best = max(kept, key=lambda r: float(r.get("tokens_per_sec") or 0))
+    return float(best["tokens_per_sec"]), best.get("description", "")
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ def best_kept(rows: list[dict]) -> tuple[int | None, str | None]:
 # ---------------------------------------------------------------------------
 
 EXPERIMENTS_PATH = REPO_ROOT / "experiments.tsv"
-_EXP_HEADER = "session\tcommit\tscore\taccuracy\ttokens_per_sec\tstatus\tdescription"
+_EXP_HEADER = "session\tcommit\ttokens_per_sec\tbpb\tstatus\tdescription"
 
 
 def read_best_json_from_main() -> dict:
@@ -156,8 +156,9 @@ def read_best_json_from_main() -> dict:
         return json.loads(raw)
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return {
-            "baseline_score": None,
-            "best_score": None,
+            "baseline_tps": None,
+            "best_tps": None,
+            "best_bpb": None,
             "best_description": None,
             "best_branch": None,
             "updated_at": None,
@@ -172,9 +173,8 @@ def write_best_json(data: dict) -> None:
 def _append_experiments(tag: str, rows: list[dict]) -> None:
     """Append session rows to experiments.tsv (call while checked out on master)."""
     new_lines = "\n".join(
-        f"{tag}\t{r.get('commit', '')}\t{r.get('score', '')}\t"
-        f"{r.get('accuracy', '')}\t{r.get('tokens_per_sec', '')}\t"
-        f"{r.get('status', '')}\t{r.get('description', '')}"
+        f"{tag}\t{r.get('commit', '')}\t{r.get('tokens_per_sec', '')}\t"
+        f"{r.get('bpb', '')}\t{r.get('status', '')}\t{r.get('description', '')}"
         for r in rows
     )
     if not EXPERIMENTS_PATH.exists():
@@ -191,10 +191,10 @@ def _append_experiments(tag: str, rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_prompt(tag: str, master_baseline: int | None, master_best: int | None) -> str:
-    """Build the kickoff prompt for the Claude agent with current score targets."""
-    baseline_str = str(master_baseline) if master_baseline is not None else "not yet established"
-    best_str = str(master_best) if master_best is not None else "not yet established"
+def build_prompt(tag: str, master_baseline: float | None, master_best: float | None) -> str:
+    """Build the kickoff prompt for the Claude agent with current throughput targets."""
+    baseline_str = f"{master_baseline:.1f} tok/s" if master_baseline is not None else "not yet established"
+    best_str = f"{master_best:.1f} tok/s" if master_best is not None else "not yet established"
     date_str = datetime.now().strftime("%Y-%m-%d")
     infer_model = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
     hardware = os.environ.get("AUTORESEARCH_HARDWARE", "unknown")
@@ -211,24 +211,26 @@ def build_prompt(tag: str, master_baseline: int | None, master_best: int | None)
 Read `program.md` for full instructions. Key points:
 
 - You are on branch `autoresearch/{tag}`.
-- Modify only `infer.py` to improve the GSM8K score.
+- Modify only `infer.py` to maximize WikiText-2 throughput.
 - Run experiments: `uv run infer.py > run.log 2>&1 & echo $! > run.pid; wait $!; rm -f run.pid`
-- Extract results: `grep "^score:\\|^accuracy:\\|^tokens_per_sec:" run.log`
-- Log to `results.tsv` (tab-separated, columns: commit score accuracy tokens_per_sec status description).
+- Extract results: `grep "^tokens_per_sec:\\|^bpb:" run.log`
+- Log to `results.tsv` (tab-separated, columns: commit tokens_per_sec bpb status description).
 - Kept experiments: git commit stays. Discarded: `git reset --hard HEAD~1`.
 
-## Score = accuracy × throughput
+## Primary metric: tokens_per_sec (maximize)
 
-`score` = correct answers in the fixed time window. It rewards **both** axes:
-- Higher accuracy (better prompting, CoT, self-consistency)
-- Higher throughput (faster generation, batching, quantization, fewer tokens)
+`tokens_per_sec` = WikiText-2 tokens scored per wall-clock second.
+Pure throughput — batching, quantization, kernel optimizations, reduced overhead.
 
-A 2× speed-up that keeps accuracy constant doubles the score. Always consider both.
+## Quality guard: bpb (do not degrade)
 
-## Score targets to beat
+`bpb` = bits per byte (lower = better). A kept experiment must not have bpb
+meaningfully higher than the baseline. If bpb rises, discard the experiment.
+
+## Targets to beat
 
 - Master baseline (unmodified infer.py): **{baseline_str}**
-- Master best score so far: **{best_str}**
+- Master best throughput so far: **{best_str}**
 
 Beat master best to have changes merged back to master automatically.
 
@@ -245,20 +247,20 @@ NEVER commit to or checkout the master branch — stay on `autoresearch/{tag}` a
 
 
 def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
-    """Append session experiments to master and merge infer.py if score improved.
+    """Append session experiments to master and merge infer.py if tps improved.
 
     Always commits experiments.tsv so every run is tracked, even when there is
-    no improvement.  If the session's best kept score beats master best, also
+    no improvement.  If the session's best kept tps beats master best, also
     updates infer.py and best.json in the same commit.
     """
     if not rows:
         return
 
-    session_score, session_desc = best_kept(rows)
-    main_best = main_data.get("best_score")
-    main_baseline = main_data.get("baseline_score")
+    session_tps, session_desc = best_kept(rows)
+    main_best = main_data.get("best_tps")
+    main_baseline = main_data.get("baseline_tps")
 
-    improved = session_score is not None and (main_best is None or session_score > main_best)
+    improved = session_tps is not None and (main_best is None or session_tps > main_best)
     record_bl = main_baseline is None
 
     original_branch = current_branch()
@@ -268,7 +270,7 @@ def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
         _append_experiments(tag, rows)
         files_to_add = ["experiments.tsv"]
 
-        if improved and session_score is not None and session_desc is not None:
+        if improved and session_tps is not None and session_desc is not None:
             infer_content = git("show", f"autoresearch/{tag}:infer.py")
             master_infer = (REPO_ROOT / "infer.py").read_text()
             if infer_content != master_infer:
@@ -282,9 +284,14 @@ def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
                 )
                 files_to_add.append("infer.py")
 
+            best_row = max(
+                (r for r in rows if r.get("status") == "keep"),
+                key=lambda r: float(r.get("tokens_per_sec") or 0),
+            )
             updated_best: dict = {
                 **main_data,
-                "best_score": session_score,
+                "best_tps": session_tps,
+                "best_bpb": float(best_row.get("bpb") or 0),
                 "best_description": session_desc,
                 "best_branch": f"autoresearch/{tag}",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -293,19 +300,19 @@ def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
                 first_kept = next((r for r in rows if r.get("status") == "keep"), None)
                 if first_kept:
                     with contextlib.suppress(ValueError, TypeError):
-                        updated_best["baseline_score"] = int(first_kept["score"])
+                        updated_best["baseline_tps"] = float(first_kept["tokens_per_sec"])
             write_best_json(updated_best)
             files_to_add.append("best.json")
-            msg = f"autoresearch/{tag}: {session_desc} (score: {session_score})"
+            msg = f"autoresearch/{tag}: {session_desc} (tps: {session_tps:.1f})"
 
         elif record_bl:
             first_kept = next((r for r in rows if r.get("status") == "keep"), None)
             if first_kept:
                 with contextlib.suppress(ValueError, TypeError):
-                    bl = int(first_kept["score"])
+                    bl = float(first_kept["tokens_per_sec"])
                     updated_bl: dict = {
                         **main_data,
-                        "baseline_score": bl,
+                        "baseline_tps": bl,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
                     write_best_json(updated_bl)
@@ -381,8 +388,8 @@ def _startup_panel(tag: str, max_turns: int, main_data: dict) -> Panel:
     time_budget = int(os.environ.get("AUTORESEARCH_TIME_BUDGET", "300"))
     date_str = datetime.now().strftime("%Y-%m-%d  %H:%M")
 
-    baseline = main_data.get("baseline_score")
-    best = main_data.get("best_score")
+    baseline = main_data.get("baseline_tps")
+    best = main_data.get("best_tps")
 
     t = Table(show_header=False, box=None, padding=(0, 2))
     t.add_column(style="dim", min_width=18)
@@ -398,8 +405,8 @@ def _startup_panel(tag: str, max_turns: int, main_data: dict) -> Panel:
     t.add_row("time budget", f"{time_budget // 60} min / run")
     t.add_row("max turns", str(max_turns))
     t.add_row("", "")
-    t.add_row("master baseline", str(baseline) if baseline is not None else "[dim]—[/dim]")
-    t.add_row("master best", str(best) if best is not None else "[dim]—[/dim]")
+    t.add_row("master baseline", f"{baseline:.1f} tok/s" if baseline is not None else "[dim]—[/dim]")
+    t.add_row("master best", f"{best:.1f} tok/s" if best is not None else "[dim]—[/dim]")
 
     return Panel(t, title="[bold cyan]autoresearch[/bold cyan]", expand=False)
 
@@ -408,8 +415,8 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
     """Launch Claude Opus 4.6 agent and stream filtered output until completion."""
     prompt = build_prompt(
         tag,
-        main_data.get("baseline_score"),
-        main_data.get("best_score"),
+        main_data.get("baseline_tps"),
+        main_data.get("best_tps"),
     )
 
     console.print(_startup_panel(tag, max_turns, main_data))
@@ -470,16 +477,16 @@ async def run_agent(tag: str, max_turns: int, main_data: dict) -> None:
 def post_session(tag: str, main_data: dict) -> None:
     """Print session summary and commit results to master."""
     rows = read_results(REPO_ROOT / "results.tsv")
-    session_score, session_desc = best_kept(rows)
+    session_tps, _session_desc = best_kept(rows)
 
-    main_best = main_data.get("best_score")
-    main_baseline = main_data.get("baseline_score")
+    main_best = main_data.get("best_tps")
+    main_baseline = main_data.get("baseline_tps")
 
     kept = [r for r in rows if r.get("status") == "keep"]
     discarded = [r for r in rows if r.get("status") == "discard"]
     crashed = [r for r in rows if r.get("status") == "crash"]
 
-    improved = session_score is not None and (main_best is None or session_score > main_best)
+    improved = session_tps is not None and (main_best is None or session_tps > main_best)
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="dim")
@@ -489,14 +496,17 @@ def post_session(tag: str, main_data: dict) -> None:
     table.add_row("  discarded", f"[yellow]{len(discarded)}[/yellow]")
     table.add_row("  crashed", f"[red]{len(crashed)}[/red]")
     table.add_row("", "")
-    table.add_row("master baseline", str(main_baseline) if main_baseline is not None else "[dim]—[/dim]")
-    table.add_row("master best", str(main_best) if main_best is not None else "[dim]—[/dim]")
-    table.add_row("session best", f"[cyan]{session_score}[/cyan]" if session_score is not None else "[dim]—[/dim]")
+    bl_str = f"{main_baseline:.1f} tok/s" if main_baseline is not None else "[dim]—[/dim]"
+    best_str = f"{main_best:.1f} tok/s" if main_best is not None else "[dim]—[/dim]"
+    ses_str = f"[cyan]{session_tps:.1f} tok/s[/cyan]" if session_tps is not None else "[dim]—[/dim]"
+    table.add_row("master baseline", bl_str)
+    table.add_row("master best", best_str)
+    table.add_row("session best", ses_str)
     table.add_row("", "")
 
-    if improved and session_score is not None:
-        delta = session_score - (main_best or 0)
-        table.add_row("outcome", f"[green]IMPROVED +{delta} → committing to master[/green]")
+    if improved and session_tps is not None:
+        delta = session_tps - (main_best or 0.0)
+        table.add_row("outcome", f"[green]IMPROVED +{delta:.1f} tok/s → committing to master[/green]")
     else:
         table.add_row("outcome", "[yellow]no improvement — recording experiments[/yellow]")
 

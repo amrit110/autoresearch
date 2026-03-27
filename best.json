@@ -1,6 +1,7 @@
 {
-  "baseline_score": null,
-  "best_score": null,
+  "baseline_tps": null,
+  "best_tps": null,
+  "best_bpb": null,
   "best_description": null,
   "best_branch": null,
   "updated_at": null

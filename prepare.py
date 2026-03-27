@@ -1,17 +1,18 @@
 """
 Fixed infrastructure for autoresearch inference experiments.
 
-Handles model loading, GSM8K dataset, and the evaluation harness.
+Handles model loading, WikiText-2 dataset, chunk preparation, and the
+throughput evaluation harness.
 Do not modify — this is the fixed ground truth.
 
 Usage (one-time setup):
     uv run prepare.py
 
-Downloads Qwen2.5-7B-Instruct and caches GSM8K test set.
+Downloads the configured model and caches the WikiText-2 test set.
 """
 
+import math
 import os
-import re
 import time
 
 import torch
@@ -39,6 +40,7 @@ console = Console()
 MODEL_ID = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 TIME_BUDGET = int(os.environ.get("AUTORESEARCH_TIME_BUDGET", "300"))  # default 5 min
+CHUNK_TOKENS = int(os.environ.get("AUTORESEARCH_CHUNK_TOKENS", "512"))
 
 # Device + dtype: CUDA on Linux/GPU servers, MPS on Apple Silicon, CPU fallback
 if torch.cuda.is_available():
@@ -57,7 +59,7 @@ else:
 
 
 def load_model_and_tokenizer():
-    """Load Qwen2.5-7B-Instruct from cache onto CUDA in bfloat16."""
+    """Load the configured model from cache onto the available device."""
     with console.status(f"[bold cyan]Loading {MODEL_ID}...[/]", spinner="dots"):
         tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_DIR, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
@@ -78,49 +80,27 @@ def load_model_and_tokenizer():
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — WikiText-2
 # ---------------------------------------------------------------------------
 
 
-def load_problems():
-    """Load GSM8K test set. Returns list of {'question': str, 'answer': str}."""
-    dataset = load_dataset("gsm8k", "main", split="test", cache_dir=CACHE_DIR)
-    return [{"question": row["question"], "answer": row["answer"]} for row in dataset]
+def load_chunks(tokenizer) -> list[dict]:
+    """Load WikiText-2 raw test set and split into fixed-size token chunks.
 
-
-# ---------------------------------------------------------------------------
-# Answer extraction and scoring
-# ---------------------------------------------------------------------------
-
-
-def extract_answer(text):
+    Returns a list of dicts, each with:
+        ids        list[int]   token IDs (length == CHUNK_TOKENS)
+        utf8_bytes int         byte length of the decoded text
     """
-    Extract the last number from a model response.
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", cache_dir=CACHE_DIR)
+    full_text = "\n\n".join(row["text"] for row in dataset if row["text"].strip())
+    all_ids = tokenizer.encode(full_text, add_special_tokens=False)
 
-    Returns normalized string (e.g. "42") or None.
-    Exported so solve() authors can use it if helpful.
-    """
-    text = text.replace(",", "")  # strip comma separators: 1,234 -> 1234
-    numbers = re.findall(r"-?\d+(?:\.\d+)?", text)
-    return numbers[-1] if numbers else None
-
-
-def score_answer(predicted, ground_truth_raw):
-    """
-    Parse '#### N' from ground_truth_raw and compare to predicted.
-
-    Returns True iff they match numerically.
-    """
-    match = re.search(r"####\s*([^\n]+)", ground_truth_raw)
-    if not match:
-        return False
-    gt = match.group(1).strip().replace(",", "")
-    if predicted is None:
-        return False
-    try:
-        return abs(float(predicted) - float(gt)) < 1e-6
-    except ValueError:
-        return predicted.strip() == gt.strip()
+    chunks = []
+    for start in range(0, len(all_ids) - CHUNK_TOKENS + 1, CHUNK_TOKENS):
+        ids = all_ids[start : start + CHUNK_TOKENS]
+        utf8_bytes = len(tokenizer.decode(ids).encode("utf-8"))
+        chunks.append({"ids": ids, "utf8_bytes": utf8_bytes})
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -128,36 +108,45 @@ def score_answer(predicted, ground_truth_raw):
 # ---------------------------------------------------------------------------
 
 
-def evaluate(solve_fn):
-    """
-    Run the fixed evaluation harness. Do not modify.
+def evaluate(infer_fn, batch_size: int = 1) -> dict:
+    """Run the fixed evaluation harness. Do not modify.
 
-    Loads model + tokenizer once, then calls solve_fn(model, tokenizer, problem)
-    on GSM8K test problems until the TIME_BUDGET (5 min) is exhausted.
+    Calls:
+        infer_fn(model, tokenizer, chunks: list[list[int]]) -> list[float]
 
-    The clock starts AFTER model loading — load time is not counted.
-    Problems are always iterated in the same fixed order for reproducibility.
-    If solve_fn raises an exception, that problem counts as wrong and the loop continues.
-    In-flight problems when the budget expires are discarded (not counted).
+    where each float is the sum of log-probabilities (nats) for the tokens in
+    that chunk.  The harness passes `batch_size` chunks per call until the
+    TIME_BUDGET is exhausted.
+
+    BPB is computed as:
+        bpb = total_NLL_nats / ln(2) / total_utf8_bytes
+
+    The clock starts AFTER model loading.  Chunks are iterated in fixed order
+    for reproducibility.  Exceptions from infer_fn skip the batch (not counted).
 
     Returns
     -------
     dict
-        score               int    correct problems solved (PRIMARY METRIC — maximize this)
-        accuracy            float  score / problems_attempted
-        tokens_per_sec      float  output tokens generated / total elapsed seconds
-        problems_attempted  int    problems started and completed within budget
-        time_elapsed        float  wall-clock seconds elapsed
+        tokens_per_sec   float   input tokens processed / elapsed seconds  (PRIMARY METRIC)
+        bpb              float   bits per byte across all processed chunks  (QUALITY GUARD)
+        chunks_processed int     chunks fully processed within budget
+        time_elapsed     float   wall-clock seconds elapsed
     """
     model, tokenizer = load_model_and_tokenizer()
-    problems = load_problems()
+    chunks = load_chunks(tokenizer)
 
-    correct = 0
-    attempted = 0
-    total_output_tokens = 0
+    all_ids = [c["ids"] for c in chunks]
+    all_bytes = [c["utf8_bytes"] for c in chunks]
+    n_chunks = len(chunks)
+
+    total_tokens = 0
+    total_nll_nats = 0.0
+    total_utf8_bytes = 0
+    chunks_processed = 0
 
     console.print(
-        f"[bold]Starting evaluation[/bold]  [dim]budget: {TIME_BUDGET}s · {len(problems)} problems available[/dim]"
+        f"[bold]Starting evaluation[/bold]  "
+        f"[dim]budget: {TIME_BUDGET}s · {n_chunks} chunks · {CHUNK_TOKENS} tokens/chunk[/dim]"
     )
 
     t_start = time.time()
@@ -175,52 +164,51 @@ def evaluate(solve_fn):
     with progress:
         task = progress.add_task("evaluating...", total=TIME_BUDGET)
 
-        for i, prob in enumerate(problems):
+        i = 0
+        while i < n_chunks:
             elapsed = time.time() - t_start
             if elapsed >= TIME_BUDGET:
                 break
 
-            question = prob["question"]
-            gt_raw = prob["answer"]
+            batch_ids = all_ids[i : i + batch_size]
+            batch_bytes = sum(all_bytes[i : i + batch_size])
+            batch_tokens = sum(len(ids) for ids in batch_ids)
 
             try:
-                response = solve_fn(model, tokenizer, question)
-                out_tokens = len(tokenizer.encode(response, add_special_tokens=False))
-                total_output_tokens += out_tokens
-                predicted = extract_answer(response)
-                if score_answer(predicted, gt_raw):
-                    correct += 1
-                attempted += 1
+                log_probs = infer_fn(model, tokenizer, batch_ids)
+                total_nll_nats += -sum(log_probs)
+                total_tokens += batch_tokens
+                total_utf8_bytes += batch_bytes
+                chunks_processed += len(batch_ids)
             except Exception as e:
-                console.print(f"[yellow]⚠[/yellow] solve_fn raised [red]{type(e).__name__}[/red] on problem {i}: {e}")
-                attempted += 1
+                console.print(f"[yellow]⚠[/yellow] infer_fn raised [red]{type(e).__name__}[/red] on chunk {i}: {e}")
+            i += batch_size
 
             elapsed = time.time() - t_start
-            acc = correct / attempted if attempted > 0 else 0.0
-            tps = total_output_tokens / elapsed if elapsed > 0 else 0.0
+            tps = total_tokens / elapsed if elapsed > 0 else 0.0
+            bpb = (total_nll_nats / math.log(2) / total_utf8_bytes) if total_utf8_bytes > 0 else float("inf")
             desc = (
-                f"[green]{correct}[/green][dim]/{attempted}[/dim] correct  "
-                f"acc [bold]{acc:.3f}[/bold]  "
-                f"[cyan]{tps:.0f}[/cyan] tok/s"
+                f"[cyan]{chunks_processed}[/cyan][dim]/{n_chunks}[/dim] chunks  "
+                f"[cyan]{tps:.0f}[/cyan] tok/s  "
+                f"bpb [bold]{bpb:.4f}[/bold]"
             )
             progress.update(task, completed=min(elapsed, TIME_BUDGET), description=desc)
             if not console.is_terminal:
                 remaining = max(0, TIME_BUDGET - elapsed)
                 print(
                     f"  [{int(elapsed):3d}s/{TIME_BUDGET}s | {int(remaining):3d}s left]"
-                    f"  {correct}/{attempted} ✓  acc {acc:.3f}  {tps:.0f} tok/s",
+                    f"  {chunks_processed} chunks  {tps:.0f} tok/s  bpb {bpb:.4f}",
                     flush=True,
                 )
 
     time_elapsed = time.time() - t_start
-    accuracy = correct / attempted if attempted > 0 else 0.0
-    tokens_per_sec = total_output_tokens / time_elapsed if time_elapsed > 0 else 0.0
+    tokens_per_sec = total_tokens / time_elapsed if time_elapsed > 0 else 0.0
+    bpb = (total_nll_nats / math.log(2) / total_utf8_bytes) if total_utf8_bytes > 0 else float("inf")
 
     return {
-        "score": correct,
-        "accuracy": accuracy,
         "tokens_per_sec": tokens_per_sec,
-        "problems_attempted": attempted,
+        "bpb": bpb,
+        "chunks_processed": chunks_processed,
         "time_elapsed": time_elapsed,
     }
 
@@ -235,13 +223,13 @@ if __name__ == "__main__":
     console.print(f"[dim]Cache directory:[/dim] {CACHE_DIR}\n")
 
     console.print("[bold]Step 1:[/bold] Downloading model weights...")
-    load_model_and_tokenizer()
+    _, tokenizer = load_model_and_tokenizer()
     console.print()
 
-    console.print("[bold]Step 2:[/bold] Caching GSM8K test set...")
-    with console.status("[cyan]Fetching GSM8K...[/]", spinner="dots"):
-        problems = load_problems()
-    console.print(f"[green]✓[/green] GSM8K cached  [dim]{len(problems)} test problems[/dim]\n")
+    console.print("[bold]Step 2:[/bold] Caching WikiText-2 test set...")
+    with console.status("[cyan]Fetching WikiText-2...[/]", spinner="dots"):
+        chunks = load_chunks(tokenizer)
+    console.print(f"[green]✓[/green] WikiText-2 cached  [dim]{len(chunks)} chunks × {CHUNK_TOKENS} tokens[/dim]\n")
 
     console.print(
         Panel(

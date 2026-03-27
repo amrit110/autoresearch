@@ -1,24 +1,25 @@
 """
 Autoresearch inference research script. Single-GPU, single-file.
 
-The base model (Qwen2.5-7B-Instruct) is fixed — no fine-tuning allowed.
+The base model is fixed — no fine-tuning allowed.
 
 Agent instructions:
 
-- Modify the INFERENCE STRATEGY section (solve() + hyperparameters).
-- Goal: maximize `score` = correct GSM8K problems solved within 5-minute budget.
-- The baseline is greedy decoding with no chain-of-thought.
-- Beat it by improving accuracy, speed, or both.
+- Modify the INFERENCE STRATEGY section (infer() + hyperparameters).
+- Goal: maximize `tokens_per_sec` on WikiText-2 without degrading `bpb`.
+- The baseline is a serial forward pass, one chunk at a time.
+- Beat it with batching, quantization, kernel optimizations, etc.
 
 Usage: uv run infer.py
 """
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from prepare import evaluate, extract_answer  # noqa: F401 — extract_answer exported for agents to use
+from prepare import evaluate
 
 
 console = Console()
@@ -27,49 +28,49 @@ console = Console()
 # Hyperparameters (edit freely)
 # ---------------------------------------------------------------------------
 
-MAX_NEW_TOKENS = 256  # generation budget per problem; lower = faster, higher = more reasoning room
-DO_SAMPLE = False  # greedy decoding by default
-TEMPERATURE = 1.0  # only applies if DO_SAMPLE = True
+BATCH_SIZE = 1  # chunks passed to infer() per call; increase for batched inference
 
 # ---------------------------------------------------------------------------
 # INFERENCE STRATEGY — agents modify this section
 # ---------------------------------------------------------------------------
 
 
-def solve(model, tokenizer, problem: str) -> str:  # type: ignore[no-untyped-def]
-    """
-    Solve a GSM8K math problem and return a response string.
+def infer(model, tokenizer, chunks: list[list[int]]) -> list[float]:  # type: ignore[no-untyped-def]
+    """Score a batch of token-ID chunks; return per-chunk log-prob sums (nats).
 
     Parameters
     ----------
     model :
-        Qwen2.5-7B-Instruct loaded on CUDA in bfloat16. Weights are fixed.
+        Causal LM loaded on device in bfloat16. Weights are fixed.
     tokenizer :
         Corresponding tokenizer.
-    problem : str
-        Plain-English math word problem.
+    chunks : list[list[int]]
+        Each inner list is CHUNK_TOKENS token IDs (all equal length).
 
     Returns
     -------
-    str
-        Response string. The scorer extracts the LAST number from the response.
+    list[float]
+        One float per chunk: sum of log P(token_t | token_{<t}) in nats.
+        Higher (less negative) means the model assigns more probability to
+        this text — i.e. lower perplexity.
 
     Notes
     -----
-    Baseline: single greedy forward pass, no system prompt.
+    Baseline: independent forward pass per chunk, no batching.
+    BPB must not degrade significantly vs. baseline — if it rises,
+    the scoring is wrong and the experiment should be discarded.
     """
-    messages = [{"role": "user", "content": problem}]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=DO_SAMPLE,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    generated = output_ids[0][inputs["input_ids"].shape[1] :]
-    return tokenizer.decode(generated, skip_special_tokens=True)
+    results = []
+    for ids in chunks:
+        input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
+        with torch.no_grad():
+            logits = model(input_ids).logits  # (1, T, V)
+        shift_logits = logits[0, :-1, :]  # (T-1, V)
+        shift_labels = input_ids[0, 1:]  # (T-1,)
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs[torch.arange(len(shift_labels)), shift_labels]
+        results.append(token_log_probs.sum().item())
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -77,25 +78,23 @@ def solve(model, tokenizer, problem: str) -> str:  # type: ignore[no-untyped-def
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    results = evaluate(solve)
+    results = evaluate(infer, batch_size=BATCH_SIZE)
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="dim")
     table.add_column(style="bold")
 
-    table.add_row("score", f"[green]{results['score']}[/green]")
-    table.add_row("accuracy", f"{results['accuracy']:.4f}")
-    table.add_row("tokens_per_sec", f"{results['tokens_per_sec']:.1f}")
-    table.add_row("problems_attempted", str(results["problems_attempted"]))
+    table.add_row("tokens_per_sec", f"[cyan]{results['tokens_per_sec']:.1f}[/cyan]")
+    table.add_row("bpb", f"{results['bpb']:.4f}")
+    table.add_row("chunks_processed", str(results["chunks_processed"]))
     table.add_row("time_elapsed", f"{results['time_elapsed']:.1f}s")
 
     console.print()
     console.print(Panel(table, title="[bold cyan]results[/bold cyan]", expand=False))
 
-    # Also print machine-parseable summary for grep in the experiment loop
+    # Machine-parseable summary for grep in the experiment loop
     print("---")
-    print(f"score:              {results['score']}")
-    print(f"accuracy:           {results['accuracy']:.4f}")
-    print(f"tokens_per_sec:     {results['tokens_per_sec']:.1f}")
-    print(f"problems_attempted: {results['problems_attempted']}")
-    print(f"time_elapsed:       {results['time_elapsed']:.1f}")
+    print(f"tokens_per_sec:   {results['tokens_per_sec']:.1f}")
+    print(f"bpb:              {results['bpb']:.4f}")
+    print(f"chunks_processed: {results['chunks_processed']}")
+    print(f"time_elapsed:     {results['time_elapsed']:.1f}")
