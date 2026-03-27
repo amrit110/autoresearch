@@ -1,7 +1,0 @@
-session	commit	score	accuracy	tokens_per_sec	status	description
-mar26	8957bdf	18	0.2609	54.8	keep	baseline: greedy, no CoT, 256 max tokens
-mar26	bcd2826	25	0.3247	57.1	keep	exp1: add CoT system prompt
-mar26	ff6b748	23	0.3026	56.0	discard	exp2: more verbose system prompt
-mar26	bbcd9c4	10	0.0714	58.8	discard	exp3: 128 max tokens - too short, accuracy crashed
-mar26	8e15932	28	0.3544	57.5	keep	exp4: concise prompt with answer format
-mar26	1a34361	8	0.3077	8.0	discard	exp5: 1-shot example - too many input tokens
