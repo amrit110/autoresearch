@@ -52,22 +52,11 @@ def solve(model, tokenizer, problem: str) -> str:  # type: ignore[no-untyped-def
     Returns
     -------
     str
-        Response string. The scorer extracts the LAST number, so chain-of-thought
-        is fine as long as the final answer is a number.
+        Response string. The scorer extracts the LAST number from the response.
 
     Notes
     -----
-    Baseline: single greedy forward pass, no system prompt, no chain-of-thought.
-
-    Ideas to try:
-
-    - Add a chain-of-thought system prompt ("think step by step")
-    - Reduce MAX_NEW_TOKENS for simpler problems (faster)
-    - Self-consistency: generate N samples, take majority vote
-    - Speculative decoding: use a small draft model + verify with this model
-    - Quantize to int8/int4 via bitsandbytes for faster generation
-    - Early stopping: detect answer token and stop immediately
-    - Batch multiple problems per forward pass (set tokenizer.padding_side = "left")
+    Baseline: single greedy forward pass, no system prompt.
     """
     messages = [{"role": "user", "content": problem}]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)

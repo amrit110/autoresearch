@@ -196,8 +196,15 @@ def build_prompt(tag: str, master_baseline: int | None, master_best: int | None)
     baseline_str = str(master_baseline) if master_baseline is not None else "not yet established"
     best_str = str(master_best) if master_best is not None else "not yet established"
     date_str = datetime.now().strftime("%Y-%m-%d")
+    infer_model = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+    hardware = os.environ.get("AUTORESEARCH_HARDWARE", "unknown")
 
     return f"""You are running an autonomous inference research session tagged `{tag}` (date: {date_str}).
+
+## Environment
+
+- Inference model: `{infer_model}`
+- Hardware: `{hardware}`
 
 ## Your task
 
@@ -370,6 +377,7 @@ def _startup_panel(tag: str, max_turns: int, main_data: dict) -> Panel:
     """Build the rich Panel shown at session start."""
     infer_model = os.environ.get("AUTORESEARCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
     infer_model_short = infer_model.split("/")[-1]  # e.g. "Qwen2.5-0.5B-Instruct"
+    hardware = os.environ.get("AUTORESEARCH_HARDWARE", "unknown")
     time_budget = int(os.environ.get("AUTORESEARCH_TIME_BUDGET", "300"))
     date_str = datetime.now().strftime("%Y-%m-%d  %H:%M")
 
@@ -385,6 +393,7 @@ def _startup_panel(tag: str, max_turns: int, main_data: dict) -> Panel:
     t.add_row("date", f"[dim]{date_str}[/dim]")
     t.add_row("", "")
     t.add_row("inference model", f"[cyan]{infer_model_short}[/cyan]")
+    t.add_row("hardware", f"[dim]{hardware}[/dim]")
     t.add_row("agent model", "claude-opus-4-6")
     t.add_row("time budget", f"{time_budget // 60} min / run")
     t.add_row("max turns", str(max_turns))

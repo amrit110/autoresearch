@@ -23,18 +23,18 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on a single L40 GPU. The inference script runs for a **fixed time budget of 5 minutes** (wall clock, excluding model loading). Launch it as: `uv run infer.py`.
 
 **What you CAN do:**
-- Modify `infer.py` — this is the only file you edit. Everything in the inference strategy is fair game: prompting, decoding parameters, chain-of-thought, self-consistency, speculative decoding, quantization, batching, early stopping, etc.
+- Modify `infer.py` freely — any inference-time technique is in scope. There are no hints and no prescribed approach. Reason from first principles about what might improve the score.
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It owns the fixed evaluation harness, model loading, and the ground-truth scoring logic.
-- Fine-tune or update the model weights. The model (Qwen2.5-7B-Instruct) is fixed.
+- Fine-tune or update the model weights. The model is fixed (see `MODEL_ID` in `prepare.py`).
 - Install new packages or add dependencies beyond what's in `pyproject.toml`.
 
-**The goal: maximize `score`** — the number of GSM8K test problems answered correctly within the 5-minute budget. This simultaneously rewards accuracy (getting answers right) and throughput (attempting more problems). There is no separate weighting — raw correct count is the metric.
+**The goal: maximize `score`** — the number of GSM8K test problems answered correctly within the 5-minute budget. Score rewards accuracy (getting answers right) AND throughput (attempting more problems) equally — raw correct count is all that matters.
 
-**VRAM** is a soft constraint. Qwen2.5-7B uses ~14 GB in bfloat16. The L40 has 48 GB total. Techniques like 4-bit quantization (bitsandbytes) are fine as long as they improve score.
+**VRAM** is a soft constraint. The active model and available hardware are shown in the agent's startup panel and in the kickoff prompt — check there for exact figures.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small score gain that adds 40 lines of complex code is not worth it. A prompt tweak that gains 5 problems is worth it. Removing complexity and keeping the same score is always a win.
+**Simplicity criterion**: All else being equal, simpler is better. Removing complexity and keeping the same score is always a win.
 
 **The first run**: Your very first run should always establish the baseline — run `infer.py` as-is without modification.
 
@@ -104,6 +104,6 @@ LOOP FOREVER:
 
 **Crashes**: If a run crashes (OOM, bug, etc.) use your judgment. Easy fix (typo, missing import)? Fix and re-run. Fundamentally broken idea? Log "crash", skip it, move on.
 
-**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human may be asleep. You are autonomous. If you run out of ideas, think harder — consider: batching strategies, speculative decoding with a smaller draft model, KV cache optimizations, adaptive compute (fewer tokens for easy problems), quantization, better prompting formats, self-consistency with majority voting, early exit when confident. The loop runs until the human interrupts you, period.
+**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human may be asleep. You are autonomous. If you run out of ideas, think harder — reason from first principles about what affects inference speed or accuracy. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. Each experiment takes ~6 minutes total, so you can run approximately 10/hour and ~80 experiments overnight. The user wakes up to a log of inference improvements.
