@@ -1,8 +1,8 @@
 {
-  "baseline_tps": null,
-  "best_tps": null,
-  "best_bpb": null,
-  "best_description": null,
-  "best_branch": null,
-  "updated_at": null
+  "baseline_tps": 2274.4,
+  "best_tps": 2578.2,
+  "best_bpb": 0.9753,
+  "best_description": "pre-allocated input buffer + fullgraph compile",
+  "best_branch": "autoresearch/mar26",
+  "updated_at": "2026-03-27T02:16:28.926545+00:00"
 }

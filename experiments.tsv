@@ -1,0 +1,31 @@
+session	commit	tokens_per_sec	bpb	status	description
+mar26	acb4110	2274.4	0.9752	keep	baseline
+mar26	a91645f	2271.6	0.9752	discard	batch_size=8 cross_entropy (no improvement)
+mar26	004a61b	2289.3	0.9753	discard	torch.compile+batch16+inference_mode (marginal)
+mar26	26c8ce1	2147.1	0.9751	discard	model internal loss (slower)
+mar26	85cdfc9	2309.7	0.9752	keep	batch8+use_cache=False+inference_mode+cross_entropy
+mar26	9388c45	2296.7	0.9752	discard	direct backbone call (no improvement)
+mar26	2ec6fe6	2245.1	0.9753	discard	torch.compile reduce-overhead (slower due to compile cost)
+mar26	88321c0	2157.2	0.9751	discard	batch16+gather/logsumexp (slower)
+mar26	968c4b0	2304.8	0.9752	discard	mega-batch internal sub-batching (no improvement)
+mar26	fe4681f	0.0	inf	crash	int8 CPU quant: NoQEngine on ARM64
+mar26	3ffcae2	2217.9	0.9751	discard	batch4+float32 CE (slower)
+mar26	1d0f6d1	2291.6	0.9752	discard	MPS_HIGH_WATERMARK_RATIO=0 (no improvement)
+mar26	4943ecb	780.2	0.9755	discard	CPU float32 + torch.compile (3x slower)
+mar26	50e242c	2298.0	0.9752	discard	pre-computed pos_ids + config.use_cache (no improvement)
+mar26	0dc8680	2035.4	0.9752	discard	eager attention (much slower than SDPA)
+mar26	32b7111	2247.2	0.9752	discard	batch_size=12 (slightly worse)
+mar26	af88442	321.3	1.4462	discard	QNNPACK int8 (slow + bpb degraded)
+mar26	e537d18	2313.4	0.9753	keep	torch.compile default + batch8 + use_cache=False
+mar26	a337c50	2519.3	0.9753	keep	torch.compile fullgraph=True + batch8 + use_cache=False
+mar26	db0660d	0.0	inf	crash	max-autotune InductorError NoValidChoices
+mar26	800a78c	2439.0	0.9753	discard	batch4+fullgraph (slightly worse than batch8)
+mar26	e5024fc	2467.2	0.9753	discard	batch16+fullgraph (worse than batch8)
+mar26	38beeb2	2471.3	0.9753	discard	dynamic=False (recompilation overhead)
+mar26	00bbd0b	2361.1	0.9753	discard	compiled full pipeline (worse, more compile overhead)
+mar26	045dc8a	2571.7	0.9753	keep	config.use_cache=False baked in before compile
+mar26	b5f47e8	2565.0	0.9753	discard	disable output_attentions/hidden_states (no improvement)
+mar26	cee86d6	2562.0	0.9753	discard	reduce-overhead mode (no improvement)
+mar26	f1d4ef6	2217.1	0.9753	discard	autocast MPS float16 (slower)
+mar26	2a71870	2473.2	0.9753	discard	batch10+fullgraph (worse than batch8)
+mar26	cd6b8f7	2578.2	0.9753	keep	pre-allocated input buffer + fullgraph compile

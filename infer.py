@@ -28,49 +28,43 @@ console = Console()
 # Hyperparameters (edit freely)
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 1  # chunks passed to infer() per call; increase for batched inference
+BATCH_SIZE = 600  # all chunks in one call
+SUB_BATCH = 8  # internal GPU batch size
 
 # ---------------------------------------------------------------------------
 # INFERENCE STRATEGY — agents modify this section
 # ---------------------------------------------------------------------------
 
+_compiled_model = None
+
+
+def _get_compiled(model):  # type: ignore[no-untyped-def]
+    """Lazily compile model with inductor backend, baking in use_cache=False."""
+    global _compiled_model  # noqa: PLW0603
+    if _compiled_model is None:
+        model.config.use_cache = False
+        _compiled_model = torch.compile(model, fullgraph=True)
+    return _compiled_model
+
 
 def infer(model, tokenizer, chunks: list[list[int]]) -> list[float]:  # type: ignore[no-untyped-def]
-    """Score a batch of token-ID chunks; return per-chunk log-prob sums (nats).
-
-    Parameters
-    ----------
-    model :
-        Causal LM loaded on device in bfloat16. Weights are fixed.
-    tokenizer :
-        Corresponding tokenizer.
-    chunks : list[list[int]]
-        Each inner list is CHUNK_TOKENS token IDs (all equal length).
-
-    Returns
-    -------
-    list[float]
-        One float per chunk: sum of log P(token_t | token_{<t}) in nats.
-        Higher (less negative) means the model assigns more probability to
-        this text — i.e. lower perplexity.
-
-    Notes
-    -----
-    Baseline: independent forward pass per chunk, no batching.
-    BPB must not degrade significantly vs. baseline — if it rises,
-    the scoring is wrong and the experiment should be discarded.
-    """
-    results = []
-    for ids in chunks:
-        input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
-        with torch.no_grad():
-            logits = model(input_ids).logits  # (1, T, V)
-        shift_logits = logits[0, :-1, :]  # (T-1, V)
-        shift_labels = input_ids[0, 1:]  # (T-1,)
-        log_probs = F.log_softmax(shift_logits, dim=-1)
-        token_log_probs = log_probs[torch.arange(len(shift_labels)), shift_labels]
-        results.append(token_log_probs.sum().item())
-    return results
+    """Process all chunks in one call with compiled sub-batching."""
+    compiled = _get_compiled(model)
+    device = model.device
+    all_ids = torch.tensor(chunks, dtype=torch.long, device=device)
+    n = all_ids.shape[0]
+    results = torch.empty(n, device=device)
+    with torch.inference_mode():
+        for i in range(0, n, SUB_BATCH):
+            batch = all_ids[i : i + SUB_BATCH]
+            logits = compiled(batch).logits
+            nll = F.cross_entropy(
+                logits[:, :-1, :].transpose(1, 2),
+                batch[:, 1:],
+                reduction="none",
+            )
+            results[i : i + batch.shape[0]] = -nll.sum(dim=1)
+    return results.tolist()
 
 
 # ---------------------------------------------------------------------------
