@@ -12,12 +12,11 @@ import argparse
 import asyncio
 import atexit
 import contextlib
-import json
 import os
 import signal
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from types import FrameType
 
@@ -142,32 +141,41 @@ def best_kept(rows: list[dict]) -> tuple[float | None, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# best.json helpers
+# experiments.tsv helpers
 # ---------------------------------------------------------------------------
 
 EXPERIMENTS_PATH = REPO_ROOT / "experiments.tsv"
 _EXP_HEADER = "session\tcommit\ttokens_per_sec\tbpb\tstatus\tdescription"
 
 
-def read_best_json_from_main() -> dict:
-    """Read best.json from master branch (not working tree)."""
+def read_master_stats() -> dict:
+    """Derive baseline_tps and best_tps from experiments.tsv on master."""
     try:
-        raw = git("show", "master:best.json")
-        return json.loads(raw)
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return {
-            "baseline_tps": None,
-            "best_tps": None,
-            "best_bpb": None,
-            "best_description": None,
-            "best_branch": None,
-            "updated_at": None,
-        }
+        raw = git("show", "master:experiments.tsv")
+    except subprocess.CalledProcessError:
+        return {"baseline_tps": None, "best_tps": None}
 
+    lines = raw.splitlines()
+    if len(lines) < 2:
+        return {"baseline_tps": None, "best_tps": None}
 
-def write_best_json(data: dict) -> None:
-    """Serialise data to best.json in the repo root."""
-    (REPO_ROOT / "best.json").write_text(json.dumps(data, indent=2) + "\n")
+    header = lines[0].split("\t")
+    rows = []
+    for line in lines[1:]:
+        if line.strip():
+            parts = line.split("\t")
+            parts += [""] * max(0, len(header) - len(parts))
+            rows.append(dict(zip(header, parts)))
+
+    kept = [r for r in rows if r.get("status") == "keep"]
+    tps_values = []
+    for r in kept:
+        with contextlib.suppress(KeyError, ValueError, TypeError):
+            tps_values.append(float(r["tokens_per_sec"]))
+
+    if not tps_values:
+        return {"baseline_tps": None, "best_tps": None}
+    return {"baseline_tps": tps_values[0], "best_tps": max(tps_values)}
 
 
 def _append_experiments(tag: str, rows: list[dict]) -> None:
@@ -249,19 +257,15 @@ NEVER commit to or checkout the master branch — stay on `autoresearch/{tag}` a
 def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
     """Append session experiments to master and merge infer.py if tps improved.
 
-    Always commits experiments.tsv so every run is tracked, even when there is
-    no improvement.  If the session's best kept tps beats master best, also
-    updates infer.py and best.json in the same commit.
+    Always commits experiments.tsv so every run is tracked.  If the session's
+    best kept tps beats master best, also updates infer.py in the same commit.
     """
     if not rows:
         return
 
     session_tps, session_desc = best_kept(rows)
     main_best = main_data.get("best_tps")
-    main_baseline = main_data.get("baseline_tps")
-
     improved = session_tps is not None and (main_best is None or session_tps > main_best)
-    record_bl = main_baseline is None
 
     original_branch = current_branch()
     try:
@@ -275,7 +279,6 @@ def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
             master_infer = (REPO_ROOT / "infer.py").read_text()
             if infer_content != master_infer:
                 (REPO_ROOT / "infer.py").write_text(infer_content)
-                # Fix any style issues the agent introduced before committing.
                 subprocess.run(
                     ["uv", "run", "pre-commit", "run", "--files", "infer.py"],
                     cwd=REPO_ROOT,
@@ -283,41 +286,7 @@ def commit_to_master(tag: str, rows: list[dict], main_data: dict) -> None:
                     check=False,
                 )
                 files_to_add.append("infer.py")
-
-            best_row = max(
-                (r for r in rows if r.get("status") == "keep"),
-                key=lambda r: float(r.get("tokens_per_sec") or 0),
-            )
-            updated_best: dict = {
-                **main_data,
-                "best_tps": session_tps,
-                "best_bpb": float(best_row.get("bpb") or 0),
-                "best_description": session_desc,
-                "best_branch": f"autoresearch/{tag}",
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            if record_bl:
-                first_kept = next((r for r in rows if r.get("status") == "keep"), None)
-                if first_kept:
-                    with contextlib.suppress(ValueError, TypeError):
-                        updated_best["baseline_tps"] = float(first_kept["tokens_per_sec"])
-            write_best_json(updated_best)
-            files_to_add.append("best.json")
             msg = f"autoresearch/{tag}: {session_desc} (tps: {session_tps:.1f})"
-
-        elif record_bl:
-            first_kept = next((r for r in rows if r.get("status") == "keep"), None)
-            if first_kept:
-                with contextlib.suppress(ValueError, TypeError):
-                    bl = float(first_kept["tokens_per_sec"])
-                    updated_bl: dict = {
-                        **main_data,
-                        "baseline_tps": bl,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    write_best_json(updated_bl)
-                    files_to_add.append("best.json")
-            msg = f"autoresearch/{tag}: record baseline + {len(rows)} experiment(s)"
         else:
             msg = f"autoresearch/{tag}: {len(rows)} experiment(s), no improvement"
 
@@ -574,8 +543,8 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Read main's persistent best before the agent changes anything
-    main_data = read_best_json_from_main()
+    # Derive baseline/best from experiments.tsv on master
+    main_data = read_master_stats()
 
     # Run the agent
     try:
